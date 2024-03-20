@@ -1,0 +1,7 @@
+plotly
+numpy
+control
+streamlit
+pandas
+scipy
+base64
