@@ -1,13 +1,13 @@
-#v032 データ一覧への針数追加、閾値による色変え
+#v037 ファイル分割
 import streamlit as st
 import numpy as np
 import pandas as pd
 import plotly.graph_objs as go
 import plotly.express as px
-from scipy.stats import skew, kurtosis
-import base64
+from scipy.stats import skew, kurtosis, anderson, shapiro, boxcox
+import func
 
-footer_text = "Ver.0.32"
+footer_text = "Ver.0.37"
 
 st.markdown(
     f"""
@@ -26,7 +26,6 @@ st.markdown(
     """,
     unsafe_allow_html=True
 )
-
 st.markdown(
     f"""
     <div class="footer">
@@ -39,29 +38,22 @@ st.markdown(
 st.header("SDD LOG解析", divider='red')
 
 # streamlitの表示用リストとタブ
-options = ['糸切れ','目飛び','締り1','締り2','締り3']
 kishu = ['小型BAS','大型BAS','全回転BAS','BUF','DA',7300]
 jikan = ['1us', '1ms', '333ns']
+options = ['糸切れ','目飛び','締り1','締り2','締り3']
 tab1, tab2, tab3, tab4, tab5 = st.tabs(["データアップ", "張力解析", "ワーク間解析", "データ整理", "3Dグラフ"])
 
-# サイドバー表示 (機種設定：速度計算は未対応）
 type = st.sidebar.selectbox('機種設定', kishu)
 count_unit = st.sidebar.selectbox('1カウントの時間', jikan)
+st.sidebar.write("3G : 1us")
+st.sidebar.write("2G : 333ns")
+
 if count_unit == '1us':
     clk = 1000
 elif count_unit == '1ms':
     clk = 1000000
 else:
     clk = 333
-st.sidebar.write("3G : 1us")
-st.sidebar.write("2G : 333ns")
-
-# データ整理用の設定値
-bitsize_arr = [1, 1, 1, 1, 1, 1, 10, 1, 1, 4, 10, 32]  # ログ1の形式 64bit
-data_size = 8   # 単位Byte
-batch_size = 8   # 単位Byte
-chunk_size = 256
-offset = 2256
 
 if type == 'BUF':
     stand = 35
@@ -118,129 +110,31 @@ else:
     d_ed = 156
     dd = 1
 
-
-# 関数準備
-# バイナリデータを任意のビット形式に変換し、整数値リストとして出力する関数
-def reshape_data(data_size, bitsize_arr, data):
-    total_bits = data_size * 8
-    if sum(bitsize_arr) > total_bits:
-        raise ValueError("ビットサイズの合計がデータサイズを超えています。")
-    result = []
-    current_bit = 0
-    for bitsize in bitsize_arr:
-        if current_bit + bitsize > total_bits:
-            raise ValueError("ビットサイズの合計がデータサイズを超えています。")
-        byte_offset = current_bit // 8
-        bit_offset = current_bit % 8
-        value = 0
-        remaining_bits = bitsize
-        while remaining_bits > 0:
-            bits_to_read = min(8 - bit_offset, remaining_bits)                      # 読み取るビット数を計算
-            mask = (1 << bits_to_read) - 1                                          # マスクを作成して特定のビット数を抽出
-            value <<= bits_to_read                                                  # 一時的な整数値を左シフトして空間を確保
-            value |= (data[byte_offset] >> (8 - bit_offset - bits_to_read)) & mask  # データを復元して value に追加
-            remaining_bits -= bits_to_read                                          # 読み取ったビット数を残りから減算
-            byte_offset += 1
-            bit_offset = 0
-        result.append(value)
-        current_bit += bitsize
-    return result
-
-# 指定のデータ数で1つのまとまりとし、配列の次元を増やす関数(3次元リスト配列)
-def split_list_into_arrays(input_list, chunk_size):
-    array_list = []
-    for i in range(0, len(input_list), chunk_size):
-        array_list.append(input_list[i:i+chunk_size])
-    return array_list
-
-# 必要データを抽出し N針 x 256 x 12 （1ワーク分）の3次元配列を生成する関数
-@st.cache_data
-def make_work(uploaded_file, stand):
-    uploaded_file.seek(offset)      # ヘッダー分の*バイトをスキップ
-    bin_data = uploaded_file.read() # スキップしたデータを読込
-    total_data_size = len(bin_data)
-    result_batches = []
-    
-    # bin_dataをbatch_sizeごとにバッチ処理する(2次元リスト配列)
-    for i in range(0, total_data_size, batch_size):
-        batch_data = bin_data[i:i+batch_size]
-        result = reshape_data(data_size, bitsize_arr, batch_data)
-        result_batches.append(result)
-    
-    # 1針目の0度からに設定
-    count = 0
-    for i in range(512):
-        count += 1
-        if result_batches[i][1] == 1:   # スタートフラグの立ち上がりを監視
-            break
-    dim = count - stand                    # 針上は60°なので、43カウント前が約0°
-    del result_batches[:dim]
-    
-    # 256個ずつの配列とする(3次元リスト配列)  [[[],[],[],...,[]],[[],[],[],...,[]],...,[[],[],[],...,[]]]
-    result_arrays = split_list_into_arrays(result_batches, chunk_size)
-    
-    # numpy配列へ変換し、最終針データを削除
-    n_array = np.array(result_arrays[:len(result_arrays)-1])
-    
-    return n_array
-
-# データフレームをCSVファイルに保存する関数
-def save_to_csv(df, file_path):
-    df.to_csv(file_path, index=False)
-    st.success(f"CSVファイルが {file_path} に保存されました。")
-
-# csv出力する関数
-def csvout(data, name, filename):
-    # CSV出力のためのボタン
-    if st.button(f"{name}", help="グラフのデータをCSVファイルに出力", type='primary'):
-        # CSV出力のためのデータフレームを作成
-        df_export = pd.DataFrame({
-            'DATA': data,
-        })
-        csv_file = df_export.to_csv(index=False)
-        b64 = base64.b64encode(csv_file.encode()).decode()
-        href = f'<a href="data:file/csv;base64,{b64}" download="{filename}.csv">{name}</a>'
-        st.markdown(href, unsafe_allow_html=True)
-
-# 行列の列で標準偏差を計算する関数
-def calculate_std_deviation(matrix):
-    std_deviation = np.std(matrix, axis=0)
-    return std_deviation
-
-def color_by_threshold(val, upper_threshold, lower_threshold):
-    if val < lower_threshold:
-        color = 'blue'
-    elif val > upper_threshold:
-        color = 'red'
-    else:
-        color = 'black'
-    return f'color: {color}'
-
 # メインプログラム
 if __name__ == "__main__":
-    
     with tab1:
         st.write("### ▼データアップロード")
         uploaded_files = st.file_uploader("BINデータをアップロードしてください", type=['bin', 'sddb'], accept_multiple_files=True)
-        
+        file_names = [file.name for file in uploaded_files]
+
         if uploaded_files:
             n_arrays = []   # 1ワーク分の3次元配列
             for uploaded_file in uploaded_files:
-                n_array = make_work(uploaded_file, stand)
+                n_array = func.make_work(uploaded_file, stand)
                 n_arrays.append(n_array)
             w_array = np.stack(n_arrays, axis=0)    # 複数ワーク分の4次元配列（同じ針数のワークしか受け付けない）
-            file_no = st.number_input('何番目のファイルを分析しますか？', min_value=1, step=1)
-            
+            file_name = st.sidebar.selectbox('解析するファイルを選択してください', file_names)
+            file_no = file_names.index(file_name)
+
             # 針数毎のグラフを重ねて表示
             angle = np.arange(0, 360, 1.40625)  # 角度に変換
-            
             # データの作成
             data1 = []
             for i in range(len(n_array)):
                 random_color = tuple(np.random.choice(range(256), size=3)) # RGBの範囲内でランダムな色を生成
                 trace = go.Scatter(
                     x = angle,
-                    y = w_array[file_no-1,i,:,6],
+                    y = w_array[file_no,i,:,6],
                     mode = 'lines',
                     name = f"{i+1}針",
                     line = dict(color = 'rgb'+str(random_color), width = 2) # 'rgb()'形式の文字列に変換
@@ -255,7 +149,7 @@ if __name__ == "__main__":
             )
             # 全張力横並び表示
             xa = np.array(range(len(n_array)*256))
-            flat = w_array[file_no-1,:,:,6].flatten()
+            flat = w_array[file_no,:,:,6].flatten()
             # データの作成
             data2 = go.Scatter(x=xa, y=flat, line=dict(color="mediumblue"), name='Array #{}'.format(i))
             # グラフのタイトルと軸ラベルの設定
@@ -268,7 +162,7 @@ if __name__ == "__main__":
                 ),
                 yaxis=dict(title='Tension'),
             )
-            
+
             if st.button("全体波形表示", help="時系列表示と重ねた波形を表示", type='primary'):    # on_clickで関数を指定できる
                 # フィギュアの作成
                 fig1 = go.Figure(data=data1, layout=layout1)
@@ -317,11 +211,10 @@ if __name__ == "__main__":
 
             # 横軸針数
             x = np.array(range(len(n_array)))
-            
             # 総和張力
             sowa = np.arange(len(n_array))  # 1針毎の総和値を入れる配列を作成
             for i in range(len(n_array)):  # 指定区間の総和値をsowa配列に保存する
-                sowa[i] = np.sum(w_array[file_no-1,i,stt:end,6]) - np.sum(w_array[file_no-1,i,dstt:dend,6])*dd  # 出会い区間128:156
+                sowa[i] = np.sum(w_array[file_no,i,stt:end,6]) - np.sum(w_array[file_no,i,dstt:dend,6])*dd  # 出会い区間128:156
 
             # 不良フラグ
             if option == '糸切れ':
@@ -334,7 +227,6 @@ if __name__ == "__main__":
                 defect_type = 7
             if option == '締り3':
                 defect_type = 8
-            
             if option2 == '糸切れ':
                 defect_type2 = 3
             if option2 == '目飛び':
@@ -349,9 +241,9 @@ if __name__ == "__main__":
             flag = np.arange(len(n_array))  # 1針毎の総和値を入れる配列を作成
             flag2 = np.arange(len(n_array))
             for i in range(len(n_array)):  # 指定区間の総和値をflag配列に保存する
-                flag[i] = np.sum(w_array[file_no-1,i,:,defect_type])
-                flag2[i] = np.sum(w_array[file_no-1,i,:,defect_type2])
-            
+                flag[i] = np.sum(w_array[file_no,i,:,defect_type])
+                flag2[i] = np.sum(w_array[file_no,i,:,defect_type2])
+
             # 速度フラグ
             speed = np.arange(len(n_array))
             speed[0] = 0  # 0rpm
@@ -359,7 +251,7 @@ if __name__ == "__main__":
             speed_dim[0] = 0
             speed_flag = np.arange(len(n_array))
             for i in range(1,len(n_array)):  # 指定区間の総和値をspeed配列に保存する
-                speed[i] = 60000000000 // (clk * (w_array[file_no-1,i,127,11] - w_array[file_no-1,i-1,127,11]))  # 10:フリーランカウンタ
+                speed[i] = 60000000000 // (clk * (w_array[file_no,i,127,11] - w_array[file_no,i-1,127,11]))  # 10:フリーランカウンタ
                 speed_dim[i] = speed[i] - speed[i-1]
                 if speed_dim[i] > flagH :
                     speed_flag[i] = 1
@@ -374,7 +266,7 @@ if __name__ == "__main__":
             data5 = go.Scatter(x=x+1, y=flag2, mode='lines+markers', line=dict(color="#AA00CC"), name=f'{option2}フラグ'.format(i), yaxis='y2') #色変えたい
             data6 = go.Scatter(x=x+1, y=speed, mode='lines+markers', line=dict(color="#6495ED"), name='縫製速度'.format(i), yaxis='y1')
             data7 = go.Scatter(x=x+1, y=speed_flag, mode='lines+markers', line=dict(color="#AAA5D1"), name='加減速フラグ'.format(i), yaxis='y2')
-            
+
             st.write("表示したい波形を選択してください")
             Sowa = st.checkbox('総和値', key='-Sowa-')
             Flag = st.checkbox('不良フラグ', key='-Flag-')
@@ -398,25 +290,25 @@ if __name__ == "__main__":
             if Speed == True:
                 data_g.extend([data6])
                 data_g.extend([data7])
-            
+
             # フィギュアの作成
             fig3 = go.Figure(data=data_g, layout=layout)
             fig3.update_layout(yaxis1=dict(side='left'), yaxis2=dict(side='right', overlaying = 'y'))
-                # フィギュアの表示
+            # フィギュアの表示
             st.plotly_chart(fig3, use_container_width=True)
-                # フィギュアの作成
+            # フィギュアの作成
             fig1 = go.Figure(data=data1, layout=layout1)
-                # フィギュアの表示
+            # フィギュアの表示
             st.plotly_chart(fig1, use_container_width=True)
-                # フィギュアの作成
+            # フィギュアの作成
             fig2 = go.Figure(data=data2, layout=layout2)
-                # フィギュアの表示
+            # フィギュアの表示
             st.plotly_chart(fig2, use_container_width=True)
             #else:
             #    st.write('データアップロード後に「重ねて表示」をクリック!!')
         else:
             st.write('### データをアップロードしてください')
-    
+
     with tab3:
         if uploaded_files:
             st.write("### ▼ワーク間解析")
@@ -429,7 +321,6 @@ if __name__ == "__main__":
                 with col2:
                     w_end = st.number_input('終了位相.', value=ten_ed)
                     st.markdown(f"<span style='font-size: 12px;'>換算</span> {w_end * 1.40625}°", unsafe_allow_html=True)
-                
                 st.write("出会い張力総和区間を設定してください")
                 col3, col4 = st.columns(2)
                 with col3:
@@ -439,10 +330,10 @@ if __name__ == "__main__":
                 with col4:
                     w_dend = st.number_input('出会い終了位相.', value=d_ed)
                     st.markdown(f"<span style='font-size: 12px;'>換算</span> {w_dend * 1.40625}°", unsafe_allow_html=True)
-            
-            w_num = st.number_input(f'合算時ワーク数を設定してください。アップロード中の総ワーク数：{len(w_array)}', min_value=1, step=1, value=50)
-            nd = st.number_input(f'何針目を解析しますか？  最大針数：{len(n_array)}針', min_value=1, max_value=len(n_array) , step=1)
 
+            w_num = st.number_input(f'合算時ワーク数を設定してください。アップロード中の総ワーク数：{len(w_array)}', min_value=1, step=1, value=50)
+            input_nd = st.number_input(f'何針目を解析しますか？  最大針数：{len(n_array)}針', min_value=1, max_value=len(n_array) , step=1)
+            nd = input_nd - 1
             x = np.array(range(len(w_array)))  # 横軸ワーク数
             ndsowa = np.arange(len(w_array))  # 各ワークのnd針目の総和値を入れる配列を作成
             for n in range(len(w_array)):  # 指定区間の総和値をsowa配列に保存する
@@ -458,11 +349,37 @@ if __name__ == "__main__":
             )
 
             # ヒストグラムを作成
-            hist = px.histogram(ndsowa, nbins=15, title=f'{nd}針目のHistogram', labels={'value': 'tension', 'count': 'Frequency'}, color_discrete_sequence=["#77AF9C"])
+            hist = px.histogram(ndsowa, nbins=15, title=f'{input_nd}針目のHistogram', labels={'value': 'tension', 'count': 'Frequency'}, color_discrete_sequence=["#77AF9C"])
             # 歪度の計算
-            skew = skew(ndsowa)
+            ske = skew(ndsowa)
             # 尖度の計算
             kurt = kurtosis(ndsowa)
+            # Shapiro-Wilk検定
+            shap = shapiro(ndsowa)
+            # Anderson–Darling検定
+            ander = anderson(ndsowa)
+            # ワーク毎の*針目のグラフを重ねて表示
+            angle = np.arange(0, 360, 1.40625)  # 角度に変換
+
+            # データの作成
+            data14 = []
+            for i in range(len(w_array)):
+                random_color = tuple(np.random.choice(range(256), size=3)) # RGBの範囲内でランダムな色を生成
+                trace = go.Scatter(
+                    x = angle,
+                    y = w_array[i,nd,:,6],
+                    mode = 'lines',
+                    name = f"{i+1}ワーク目",
+                    line = dict(color = 'rgb'+str(random_color), width = 2) # 'rgb()'形式の文字列に変換
+                )
+                data14.append(trace)
+            # レイアウトの作成
+            layout14 = go.Layout(
+                title = f'各ワークの{input_nd}針目の張力波形',
+                xaxis = dict(title = 'Angle'),
+                yaxis = dict(title = 'Tension'),
+                showlegend = True
+            )
 
             # 標準偏差の移動平均
             std_devs1 = []
@@ -506,7 +423,7 @@ if __name__ == "__main__":
                     else:
                         std_devs3.append(std_dev3)  # 最初の場合はそのまま追加
             #st.write(std_devs3)
-            
+
             # データの作成
             data11 = go.Scatter(x=x+1, y=std_devs3, mode='lines+markers', line=dict(color="#77AF9C"),  name='STD3'.format(i))
             # レイアウトの作成
@@ -517,44 +434,38 @@ if __name__ == "__main__":
                 showlegend=True
             )
 
-            if st.button("解析波形出力", help="指定針目の指定区間総和値をワーク毎に表示", type='primary'):
-                # フィギュアの作成
-                fig8 = go.Figure(data=data8, layout=layout8)
-                # フィギュアの表示
-                st.plotly_chart(fig8, use_container_width=True)
+            # フィギュアの作成
+            fig8 = go.Figure(data=data8, layout=layout8)
+            # フィギュアの表示
+            st.plotly_chart(fig8, use_container_width=True)
+            # フィギュアの作成
+            fig14 = go.Figure(data=data14, layout=layout14)
+            # フィギュアの表示
+            st.plotly_chart(fig14, use_container_width=True)
+            # フィギュアの表示
+            st.plotly_chart(hist, use_container_width=True)
+            st.write(f'歪度：{ske}（正 : 左寄り、負 : 右寄り、0に近いほど正規性あり）')
+            st.write(f'尖度：{kurt}（正 : 尖っている、負 : 尖ってない、0に近いほど正規性あり）')
+            st.write(f'Shapiro-Wilk検定 p値 {shap.pvalue}')
+            st.write(f'Anderson–Darling検定 statistic = {ander.statistic}')
 
-                # フィギュアの表示
-                st.plotly_chart(hist, use_container_width=True)
-                st.write(f'歪度：{skew}（正 : 左寄り、負 : 右寄り、0に近いほど正規性あり）')
-                st.write(f'尖度：{kurt}（正 : 尖っている、負 : 尖ってない、0に近いほど正規性あり）')
-
+            with st.expander("標準偏差のグラフ", expanded=False):
                 # フィギュアの作成
                 fig9 = go.Figure(data=data9, layout=layout9)
                 # フィギュアの表示
                 st.plotly_chart(fig9, use_container_width=True)
-
                 # フィギュアの作成
                 fig10 = go.Figure(data=data10, layout=layout10)
                 # フィギュアの表示
                 st.plotly_chart(fig10, use_container_width=True)
-
                 # フィギュアの作成
                 fig11 = go.Figure(data=data11, layout=layout11)
                 # フィギュアの表示
                 st.plotly_chart(fig11, use_container_width=True)
-                
-            else:
-                st.write('解析波形出力後に「解析波形出力」をクリック!!')
-            
-            st.write("### ▼csv出力")
-            csvout(ndsowa, '総和張力のcsv出力', 'sowa')
-            csvout(std_devs1, '移動stdのcsv出力', 'i_std')
-            csvout(std_devs2, '10ワークずつ増やすSTDのcsv出力', '10_std')
-            csvout(std_devs3, '合算stdのcsv出力', 'g_std')
-            
+
         else:
             st.write('### データをアップロードしてください')
-            
+
     with tab4:
         if uploaded_files:
             st.write("### ▼データ整理")
@@ -575,7 +486,7 @@ if __name__ == "__main__":
                 with col4:
                     w_dend = st.number_input('出会い終了位相,', value=d_ed)
                     st.markdown(f"<span style='font-size: 12px;'>換算</span> {w_dend * 1.40625}°", unsafe_allow_html=True)
-            
+
             x = np.array(range(len(n_array)))  # 横軸針数
             for i in range(len(n_array)):
                 x[i] = i+1
@@ -593,7 +504,32 @@ if __name__ == "__main__":
             ave = np.zeros(len(n_array))
             for i in range(len(n_array)):
                 ave[i] = np.mean(nwsowa[:,i])
-            
+            # 尖度の計算
+            kurt_box = np.zeros(len(n_array))
+            for i in range(len(n_array)):
+                kurt_box[i] = kurtosis(nwsowa[:,i])
+            # 歪度の算出
+            skew_box = np.zeros(len(n_array))
+            for i in range(len(n_array)):
+                skew_box[i] = skew(nwsowa[:,i])
+            # Shapiro-Wilk検定
+            shap_box = np.zeros(len(n_array))
+            for i in range(len(n_array)):
+                shap_box[i] = shapiro(nwsowa[:,i]).pvalue
+            # Anderson–Darling検定
+            ander_box = np.zeros(len(n_array))
+            for i in range(len(n_array)):
+                ander_box[i] = anderson(nwsowa[:,i]).statistic
+            # boxcox変換
+            nw_boxcox = np.zeros((len(n_array), len(w_array)))
+            shap_boxcox = np.zeros(len(n_array))
+            ander_boxcox = np.zeros(len(n_array))
+            for i in range(len(n_array)):
+                transformed_data, _ = boxcox(nwsowa[:, i])
+                nw_boxcox[i, :] = transformed_data
+                shap_boxcox[i] = shapiro(nw_boxcox[i,:]).pvalue
+                ander_boxcox[i] = anderson(nw_boxcox[i,:]).statistic
+
             # データ一覧化
             joho = []
             for i in range(len(w_array)):
@@ -604,14 +540,20 @@ if __name__ == "__main__":
             joho.insert(0,x)
             joho.insert(1,ave)
             joho.insert(2,std)
+            joho.insert(3,skew_box)
+            joho.insert(4,kurt_box)
+            joho.insert(5,shap_box)
+            joho.insert(6,shap_boxcox)
+            joho.insert(7,ander_box)
+            joho.insert(8,ander_boxcox)
             df = pd.DataFrame(joho)
-            new_index = ['針数', '平均張力', '標準偏差'] + [str(i) + 'ワーク目' for i in range(1, len(df)+1)]
+            new_index = ['針数', '平均張力', '標準偏差','歪度', '尖度', 'shapiro', 'boxcox_shap', 'anderson', 'boxcox_ander'] + [str(i) + 'ワーク目' for i in range(1, len(df)+1)]
             df.index = new_index[:len(df.index)]  # 新しいインデックスを設定する
-            
+
             k = st.number_input('閾値係数k（青：閾値より小さい　赤：閾値より大きい）', value=3.0)
             upper_threshold = ave + (std * k)
             lower_threshold = ave - (std * k)
-            styled_df = df.style.apply(lambda x: [color_by_threshold(val, upper_threshold[x.name], lower_threshold[x.name]) for val in x])
+            styled_df = df.style.apply(lambda x: [func.color_by_threshold(val, upper_threshold[x.name], lower_threshold[x.name]) for val in x])
             with st.expander("### データ一覧", expanded=False):
                 st.write(styled_df)
 
@@ -619,7 +561,6 @@ if __name__ == "__main__":
             csv_data = df.to_csv(index=False)
             st.download_button(
                 label="CSVファイルをダウンロード",
-                help="1行目 index 2行目 針数 3行目 標準偏差 4行目 平均張力 5行目以降 総和張力（列が針数）",
                 data=csv_data,
                 file_name='data.csv',
                 mime='text/csv'
@@ -627,7 +568,7 @@ if __name__ == "__main__":
 
         else:
             st.write('### データをアップロードしてください')
-        
+
     with tab5:
         if uploaded_files:
             st.write("### ▼3Dグラフ")
@@ -676,7 +617,7 @@ if __name__ == "__main__":
                     ysowa.append(nd)
                     wsowa[nd][n] = np.sum(w_array[n,nd,s_stt:s_end,6]) - np.sum(w_array[n,nd,s_dstt:s_dend,6])*dd
                     zsowa.append(wsowa[nd][n])
-            
+
             wstd = np.arange(len(n_array))
             std_10 = np.zeros((len(n_array),len(w_array)//10))
             for p in range(n_s-1,n_e,wn):
@@ -694,7 +635,7 @@ if __name__ == "__main__":
                 with col2:
                     th_sowa_t = st.number_input('総和張力の加減閾値を設定', value=6000)
                     th_sigma_t = st.number_input('総和張力の加減閾値を設定', value=1000)
-                
+
             # 色を変更する条件を指定
             color_sowa = ["#77AF9C" if th_sowa_u <= z_val <= th_sowa_t else 'red' for z_val in zsowa]
             color_sigma = ['#87ceeb' if th_sigma_u <= z_val < th_sigma_t else 'red' for z_val in zstd]
